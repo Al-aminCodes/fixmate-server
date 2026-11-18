@@ -335,6 +335,150 @@ app.post("/services", async (req, res) => {
     });
   }
 });
+app.post("/bookings", verfiyToken, async (req, res) => {
+  try {
+    const user = req.user;
+
+    // Only customers can request repairs
+    if (user.role !== "customer") {
+      return res.status(403).send({
+        success: false,
+        message: "Only customers can request a repair",
+      });
+    }
+
+    const { serviceId, phone, address, preferredDate, problemDescription } =
+      req.body;
+
+    // Validate service ID
+    if (!serviceId || !ObjectId.isValid(serviceId)) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid service ID",
+      });
+    }
+
+    // Validate required fields
+    if (!phone?.trim() || !address?.trim() || !preferredDate) {
+      return res.status(400).send({
+        success: false,
+        message: "Please fill in all required fields",
+      });
+    }
+
+    if (!problemDescription || problemDescription.trim().length < 20) {
+      return res.status(400).send({
+        success: false,
+        message: "Problem description must be at least 20 characters",
+      });
+    }
+
+    // Validate date
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(preferredDate)) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid preferred date",
+      });
+    }
+
+    const parsedDate = new Date(`${preferredDate}T00:00:00`);
+
+    if (
+      Number.isNaN(parsedDate.getTime()) ||
+      parsedDate.toISOString().slice(0, 10) !== preferredDate
+    ) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid preferred date",
+      });
+    }
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    if (parsedDate < today) {
+      return res.status(400).send({
+        success: false,
+        message: "Preferred date cannot be in the past",
+      });
+    }
+
+    // Find approved and available service
+    const service = await servicesCollection.findOne({
+      _id: new ObjectId(serviceId),
+      approvalStatus: "approved",
+      isAvailable: true,
+    });
+
+    if (!service) {
+      return res.status(404).send({
+        success: false,
+        message: "Service is no longer available",
+      });
+    }
+
+    // Find technician profile
+    const technician = await techniciansCollection.findOne({
+      email: service.technicianEmail,
+    });
+
+    // Customer identity comes from authenticated session
+    const customerEmail = user.email.toLowerCase();
+
+    // Save booking
+    const booking = {
+      serviceId: service._id,
+      serviceTitle: service.title,
+      serviceImage: service.image,
+      category: service.category,
+      basePrice: service.basePrice,
+
+      technicianName: service.technicianName,
+      technicianEmail: service.technicianEmail,
+      technicianPhoto: technician?.image || "",
+
+      customerName: user.name,
+      customerEmail,
+      customerPhone: phone.trim(),
+
+      address: address.trim(),
+      preferredDate: parsedDate,
+      problemDescription: problemDescription.trim(),
+
+      status: "requested",
+      paymentStatus: "unpaid",
+
+      activeRequestKey: "active",
+
+      createdAt: new Date(),
+    };
+
+    const result = await bookingsCollection.insertOne(booking);
+
+    res.status(201).send({
+      success: true,
+      message: "Repair request submitted successfully",
+      data: {
+        _id: result.insertedId,
+      },
+    });
+  } catch (error) {
+    // Duplicate active booking
+    if (error.code === 11000) {
+      return res.status(409).send({
+        success: false,
+        message: "You already have an active request for this service",
+      });
+    }
+
+    console.error("Booking error:", error);
+
+    res.status(500).send({
+      success: false,
+      message: "Failed to submit repair request",
+    });
+  }
+});
 
 app.listen(port, () => {
   console.log(`server app listening on port ${port}`);
