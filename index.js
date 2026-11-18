@@ -5,7 +5,14 @@ import cors from "cors";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 
 const app = express();
-app.use(cors());
+app.use(
+  cors({
+    origin: process.env.CLIENT_URL,
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  }),
+);
 app.use(express.json());
 
 const port = 8000;
@@ -132,7 +139,7 @@ app.get("/services/:id", async (req, res) => {
       });
     }
 
-    const technician = await techniciansCollection.findOne({
+    const technician = await servicesCollection.findOne({
       email: service.technicianEmail,
     });
 
@@ -160,6 +167,12 @@ app.get("/services/:id", async (req, res) => {
   }
 });
 
+app.get("/user/:email", async (req, res) => {
+  const { email } = req.params;
+  const result = await users.findOne({ email: email });
+  res.send(result);
+});
+
 app.get("/admin/services", async (req, res) => {
   try {
     const services = await servicesCollection
@@ -180,6 +193,106 @@ app.get("/admin/services", async (req, res) => {
     res.status(500).send({
       success: false,
       message: "Failed to fetch services.",
+    });
+  }
+});
+
+app.get("/bookings", async (req, res) => {
+  try {
+    const { technicianEmail } = req.query;
+
+    if (!technicianEmail) {
+      return res.status(400).send({
+        success: false,
+        message: "Technician email is required.",
+      });
+    }
+
+    const bookings = await bookingsCollection
+      .find({
+        technicianEmail: technicianEmail.toLowerCase(),
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.send({ success: true, bookings });
+  } catch (error) {
+    res.status(500).send({
+      success: false,
+      message: "Failed to fetch bookings.",
+    });
+  }
+});
+app.patch("/bookings/:id/status", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, finalAmount } = req.body;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid booking ID.",
+      });
+    }
+
+    const allowedTransitions = {
+      requested: ["accepted", "rejected"],
+      accepted: ["in-progress"],
+      "in-progress": ["completed"],
+    };
+
+    const booking = await bookingsCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!booking) {
+      return res.status(404).send({
+        success: false,
+        message: "Booking not found.",
+      });
+    }
+
+    if (!allowedTransitions[booking.status]?.includes(status)) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid booking status transition.",
+      });
+    }
+
+    const updateData = {
+      status,
+      updatedAt: new Date(),
+    };
+
+    if (status === "completed") {
+      if (
+        typeof finalAmount !== "number" ||
+        !Number.isFinite(finalAmount) ||
+        finalAmount <= 0
+      ) {
+        return res.status(400).send({
+          success: false,
+          message: "A valid final amount is required.",
+        });
+      }
+
+      updateData.finalAmount = finalAmount;
+    }
+
+    await bookingsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: updateData },
+    );
+
+    res.send({
+      success: true,
+      message: `Booking ${status} successfully.`,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      success: false,
+      message: "Failed to update booking.",
     });
   }
 });
@@ -335,11 +448,20 @@ app.post("/services", async (req, res) => {
     });
   }
 });
+
 app.post("/bookings", verfiyToken, async (req, res) => {
   try {
     const user = req.user;
 
-    // Only customers can request repairs
+    // 1. Check authentication
+    if (!user) {
+      return res.status(401).send({
+        success: false,
+        message: "Please log in to request a repair",
+      });
+    }
+
+    // 2. Only customers can request repairs
     if (user.role !== "customer") {
       return res.status(403).send({
         success: false,
@@ -350,7 +472,7 @@ app.post("/bookings", verfiyToken, async (req, res) => {
     const { serviceId, phone, address, preferredDate, problemDescription } =
       req.body;
 
-    // Validate service ID
+    // 3. Validate service ID
     if (!serviceId || !ObjectId.isValid(serviceId)) {
       return res.status(400).send({
         success: false,
@@ -358,30 +480,39 @@ app.post("/bookings", verfiyToken, async (req, res) => {
       });
     }
 
-    // Validate required fields
-    if (!phone?.trim() || !address?.trim() || !preferredDate) {
+    // 4. Validate required fields
+    if (
+      !phone?.trim() ||
+      !address?.trim() ||
+      !preferredDate ||
+      !problemDescription?.trim()
+    ) {
       return res.status(400).send({
         success: false,
         message: "Please fill in all required fields",
       });
     }
 
-    if (!problemDescription || problemDescription.trim().length < 20) {
+    // 5. Validate problem description
+    if (problemDescription.trim().length < 20) {
       return res.status(400).send({
         success: false,
         message: "Problem description must be at least 20 characters",
       });
     }
 
-    // Validate date
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(preferredDate)) {
+    // 6. Validate preferred date
+    if (
+      typeof preferredDate !== "string" ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(preferredDate)
+    ) {
       return res.status(400).send({
         success: false,
         message: "Invalid preferred date",
       });
     }
 
-    const parsedDate = new Date(`${preferredDate}T00:00:00`);
+    const parsedDate = new Date(`${preferredDate}T00:00:00.000Z`);
 
     if (
       Number.isNaN(parsedDate.getTime()) ||
@@ -393,17 +524,22 @@ app.post("/bookings", verfiyToken, async (req, res) => {
       });
     }
 
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    // Compare against Bangladesh local calendar date
+    const today = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Dhaka",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(new Date());
 
-    if (parsedDate < today) {
+    if (preferredDate < today) {
       return res.status(400).send({
         success: false,
         message: "Preferred date cannot be in the past",
       });
     }
 
-    // Find approved and available service
+    // 7. Find approved and available service
     const service = await servicesCollection.findOne({
       _id: new ObjectId(serviceId),
       approvalStatus: "approved",
@@ -417,17 +553,34 @@ app.post("/bookings", verfiyToken, async (req, res) => {
       });
     }
 
-    // Find technician profile
-    const technician = await techniciansCollection.findOne({
+    // 8. Get technician information
+    const technician = await servicesCollection.findOne({
       email: service.technicianEmail,
     });
 
-    // Customer identity comes from authenticated session
+    // 9. Get authenticated customer email
     const customerEmail = user.email.toLowerCase();
 
-    // Save booking
+    // 10. Check existing active booking
+    const existingBooking = await bookingsCollection.findOne({
+      serviceId: service._id.toString(),
+      customerEmail,
+      status: {
+        $in: ["requested", "accepted", "in-progress"],
+      },
+    });
+
+    if (existingBooking) {
+      return res.status(409).send({
+        success: false,
+        message: "You already have an active request for this service",
+      });
+    }
+
+    // 11. Create booking document
     const booking = {
-      serviceId: service._id,
+      serviceId: service._id.toString(),
+
       serviceTitle: service.title,
       serviceImage: service.image,
       category: service.category,
@@ -453,9 +606,10 @@ app.post("/bookings", verfiyToken, async (req, res) => {
       createdAt: new Date(),
     };
 
+    // 12. Insert booking
     const result = await bookingsCollection.insertOne(booking);
 
-    res.status(201).send({
+    return res.status(201).send({
       success: true,
       message: "Repair request submitted successfully",
       data: {
@@ -463,7 +617,7 @@ app.post("/bookings", verfiyToken, async (req, res) => {
       },
     });
   } catch (error) {
-    // Duplicate active booking
+    // Handle duplicate active booking index
     if (error.code === 11000) {
       return res.status(409).send({
         success: false,
@@ -473,7 +627,7 @@ app.post("/bookings", verfiyToken, async (req, res) => {
 
     console.error("Booking error:", error);
 
-    res.status(500).send({
+    return res.status(500).send({
       success: false,
       message: "Failed to submit repair request",
     });
