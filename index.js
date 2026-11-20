@@ -31,7 +31,7 @@ export async function connectToMongoDB() {
 }
 const mongodbClient = await connectToMongoDB();
 const db = mongodbClient.db("fix-mate");
-const users = db.collection("user");
+const usersCollection = db.collection("user");
 const sessions = db.collection("session");
 const servicesCollection = db.collection("services");
 const bookingsCollection = db.collection("bookings");
@@ -227,7 +227,7 @@ const verfiyToken = async (req, res, netx) => {
 
   const userId = result.userId;
   const qureyId = { _id: new ObjectId(userId) };
-  const user = await users.findOne(qureyId);
+  const user = await usersCollection.findOne(qureyId);
   if (!user) {
     res.status(401).send({ message: "unauthorized" });
   }
@@ -238,6 +238,14 @@ const verfiyToken = async (req, res, netx) => {
 app.get("/", (req, res) => {
   res.send("server is runing");
 });
+
+const verifyAdmin = (req, res, next) => {
+  if (req.user.role !== "admin") {
+    res.status(401).send({ message: "forbient" });
+    return;
+  }
+  next();
+};
 
 // services api
 // service post method
@@ -340,6 +348,55 @@ app.get("/services-limit", async (req, res) => {
   res.send(data);
 });
 
+const validRoles = ["customer", "technician", "admin"];
+
+// GET ALL USERS
+app.get("/admin/users", verfiyToken, verifyAdmin, async (req, res) => {
+  try {
+    if (req.user.role !== "admin") {
+      return res.status(403).send({
+        success: false,
+        message: "Admin access required.",
+      });
+    }
+
+    const users = await usersCollection
+      .find(
+        {},
+        {
+          projection: {
+            name: 1,
+            email: 1,
+            image: 1,
+            role: 1,
+            createdAt: 1,
+          },
+        },
+      )
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.send({
+      success: true,
+      users: users.map((user) => ({
+        id: user._id.toString(),
+        name: user.name,
+        email: user.email,
+        image: user.image || "",
+        role: user.role || "customer",
+        createdAt: user.createdAt,
+      })),
+    });
+  } catch (error) {
+    console.error("Get admin users error:", error);
+
+    res.status(500).send({
+      success: false,
+      message: "Failed to fetch users.",
+    });
+  }
+});
+
 app.get("/user/:email", async (req, res) => {
   const { email } = req.params;
   const result = await users.findOne({ email: email });
@@ -398,6 +455,38 @@ app.get("/admin/services", async (req, res) => {
     });
   }
 });
+
+app.get("/admin/bookings", verfiyToken, verifyAdmin, async (req, res) => {
+  try {
+    if (req.user.role !== "admin") {
+      return res.status(403).send({
+        success: false,
+        message: "Admin access required.",
+      });
+    }
+
+    const bookings = await bookingsCollection
+      .find({})
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.send({
+      success: true,
+      bookings: bookings.map((booking) => ({
+        ...booking,
+        _id: booking._id.toString(),
+      })),
+    });
+  } catch (error) {
+    console.error("Admin bookings error:", error);
+
+    res.status(500).send({
+      success: false,
+      message: "Failed to fetch bookings.",
+    });
+  }
+});
+
 app.get("/technician/services", verfiyToken, async (req, res) => {
   try {
     if (req.user.role !== "technician") {
@@ -686,6 +775,77 @@ app.patch("/services/:id", verfiyToken, async (req, res) => {
     });
   }
 });
+
+// UPDATE USER ROLE
+app.patch(
+  "/admin/users/:id/role",
+  verfiyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      if (req.user.role !== "admin") {
+        return res.status(403).send({
+          success: false,
+          message: "Admin access required.",
+        });
+      }
+
+      const { id } = req.params;
+      const { role } = req.body;
+
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).send({
+          success: false,
+          message: "Invalid user ID.",
+        });
+      }
+
+      if (!validRoles.includes(role)) {
+        return res.status(400).send({
+          success: false,
+          message: "Invalid user role.",
+        });
+      }
+
+      // Prevent changing your own role.
+      if (id === req.user.id) {
+        return res.status(403).send({
+          success: false,
+          message: "You cannot change your own role.",
+        });
+      }
+
+      const result = await usersCollection.updateOne(
+        { _id: new ObjectId(id) },
+        {
+          $set: {
+            role,
+            updatedAt: new Date(),
+          },
+        },
+      );
+
+      if (result.matchedCount === 0) {
+        return res.status(404).send({
+          success: false,
+          message: "User not found.",
+        });
+      }
+
+      res.send({
+        success: true,
+        message: "User role updated successfully.",
+      });
+    } catch (error) {
+      console.error("Update user role error:", error);
+
+      res.status(500).send({
+        success: false,
+        message: "Failed to update user role.",
+      });
+    }
+  },
+);
 
 // Approve or reject a service
 app.patch("/admin/services/:id/approval", async (req, res) => {
