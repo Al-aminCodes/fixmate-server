@@ -335,6 +335,10 @@ app.get("/services/:id", async (req, res) => {
     });
   }
 });
+app.get("/services-limit", async (req, res) => {
+  const data = await servicesCollection.find().limit(6).toArray();
+  res.send(data);
+});
 
 app.get("/user/:email", async (req, res) => {
   const { email } = req.params;
