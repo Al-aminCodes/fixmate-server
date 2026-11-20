@@ -2,9 +2,11 @@ import express from "express";
 import { MongoClient, ObjectId } from "mongodb";
 import "dotenv/config";
 import cors from "cors";
+import Stripe from "stripe";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 
 const app = express();
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 app.use(
   cors({
     origin: process.env.CLIENT_URL,
@@ -13,8 +15,6 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization"],
   }),
 );
-app.use(express.json());
-
 const port = 8000;
 
 const mongobdurl = process.env.MONGODB_URL;
@@ -35,6 +35,177 @@ const users = db.collection("user");
 const sessions = db.collection("session");
 const servicesCollection = db.collection("services");
 const bookingsCollection = db.collection("bookings");
+const paymentsCollection = db.collection("payments");
+await paymentsCollection.createIndex({ stripeSessionId: 1 }, { unique: true });
+
+const BDT_TO_USD_RATE = Number(process.env.BDT_TO_USD_RATE);
+app.post(
+  "/stripe/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    let event;
+
+    // Verify Stripe signature
+    try {
+      const signature = req.headers["stripe-signature"];
+
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        signature,
+        process.env.STRIPE_WEBHOOK_SECRET,
+      );
+    } catch (error) {
+      console.error("Stripe signature verification failed:", error.message);
+
+      return res.status(400).send(`Webhook Error: ${error.message}`);
+    }
+
+    try {
+      if (event.type !== "checkout.session.completed") {
+        return res.send({ received: true });
+      }
+
+      const session = event.data.object;
+
+      // Only process successful payments
+      if (session.payment_status !== "paid") {
+        return res.send({ received: true });
+      }
+
+      const bookingId = session.metadata?.bookingId;
+      const customerEmail = session.metadata?.customerEmail;
+
+      if (!bookingId || !ObjectId.isValid(bookingId) || !customerEmail) {
+        console.error("Invalid booking metadata:", session.metadata);
+
+        return res.status(400).send({
+          received: false,
+          message: "Invalid checkout metadata",
+        });
+      }
+
+      if (session.currency !== "usd") {
+        return res.status(400).send({
+          received: false,
+          message: "Unexpected payment currency",
+        });
+      }
+
+      const transactionId =
+        typeof session.payment_intent === "string"
+          ? session.payment_intent
+          : session.payment_intent?.id;
+
+      if (!transactionId) {
+        return res.status(400).send({
+          received: false,
+          message: "Stripe PaymentIntent ID not found",
+        });
+      }
+
+      const normalizedEmail = customerEmail.toLowerCase();
+
+      // Find the exact booking associated with this Checkout Session
+      const booking = await bookingsCollection.findOne({
+        _id: new ObjectId(bookingId),
+        customerEmail: normalizedEmail,
+        status: "completed",
+        stripeSessionId: session.id,
+      });
+
+      if (!booking) {
+        // Return 500 so Stripe can retry if booking data is temporarily unavailable
+        console.error("Matching booking not found:", bookingId);
+
+        return res.status(500).send({
+          received: false,
+          message: "Matching booking not found",
+        });
+      }
+
+      const paidAmount = session.amount_total / 100;
+
+      if (!Number.isFinite(paidAmount) || paidAmount <= 0) {
+        return res.status(400).send({
+          received: false,
+          message: "Invalid Stripe payment amount",
+        });
+      }
+
+      const paidAt = new Date(
+        (session.created || Math.floor(Date.now() / 1000)) * 1000,
+      );
+
+      // Update booking payment status
+      await bookingsCollection.updateOne(
+        {
+          _id: booking._id,
+          customerEmail: normalizedEmail,
+          stripeSessionId: session.id,
+          status: "completed",
+        },
+        {
+          $set: {
+            paymentStatus: "paid",
+            stripePaymentIntentId: transactionId,
+            paidAt,
+            updatedAt: new Date(),
+          },
+        },
+      );
+
+      // Save transaction in payments collection.
+      // Unique stripeSessionId + $setOnInsert prevents duplicate records
+      // when Stripe sends the same webhook more than once.
+      await paymentsCollection.updateOne(
+        {
+          stripeSessionId: session.id,
+        },
+        {
+          $setOnInsert: {
+            bookingId: booking._id.toString(),
+
+            serviceTitle: booking.serviceTitle,
+
+            customerName: booking.customerName,
+            customerEmail: normalizedEmail,
+
+            technicianName: booking.technicianName,
+            technicianEmail: booking.technicianEmail,
+
+            amount: paidAmount,
+            currency: "usd",
+
+            transactionId,
+            stripeSessionId: session.id,
+
+            paymentStatus: "paid",
+            paidAt,
+          },
+        },
+        {
+          upsert: true,
+        },
+      );
+
+      console.log("Payment successfully saved:", session.id);
+
+      return res.send({
+        received: true,
+        message: "Payment processed successfully",
+      });
+    } catch (error) {
+      console.error("Webhook processing error:", error);
+
+      return res.status(500).send({
+        received: false,
+        message: "Webhook processing failed",
+      });
+    }
+  },
+);
+
+app.use(express.json());
 
 const verfiyToken = async (req, res, netx) => {
   const header = req.headers.authorization;
@@ -172,6 +343,35 @@ app.get("/user/:email", async (req, res) => {
   const result = await users.findOne({ email: email });
   res.send(result);
 });
+app.get("/customer/bookings", verfiyToken, async (req, res) => {
+  try {
+    if (req.user.role !== "customer") {
+      return res.status(403).send({
+        success: false,
+        message: "Only customers can access their bookings",
+      });
+    }
+
+    const customerEmail = req.user.email.toLowerCase();
+
+    const bookings = await bookingsCollection
+      .find({ customerEmail })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.send({
+      success: true,
+      bookings,
+    });
+  } catch (error) {
+    console.error("Get customer bookings:", error);
+
+    res.status(500).send({
+      success: false,
+      message: "Failed to fetch bookings",
+    });
+  }
+});
 
 app.get("/admin/services", async (req, res) => {
   try {
@@ -250,6 +450,41 @@ app.get("/bookings", async (req, res) => {
     });
   }
 });
+
+app.get("/customer/payments", verfiyToken, async (req, res) => {
+  try {
+    // Only customer can access payment history
+    if (req.user.role !== "customer") {
+      return res.status(403).json({
+        success: false,
+        message: "Access denied",
+      });
+    }
+
+    const customerEmail = req.user.email.toLowerCase();
+
+    const payments = await paymentsCollection
+      .find({
+        customerEmail,
+        paymentStatus: "paid",
+      })
+      .sort({ paidAt: -1 })
+      .toArray();
+
+    res.status(200).json({
+      success: true,
+      payments,
+    });
+  } catch (error) {
+    console.error("Customer payments error:", error);
+
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch payment history",
+    });
+  }
+});
+
 app.patch("/bookings/:id/status", async (req, res) => {
   try {
     const { id } = req.params;
@@ -560,6 +795,59 @@ app.patch("/services/:id/availability", verfiyToken, async (req, res) => {
     });
   }
 });
+app.patch("/customer/bookings/:id/cancel", verfiyToken, async (req, res) => {
+  try {
+    if (req.user.role !== "customer") {
+      return res.status(403).send({
+        success: false,
+        message: "Only customers can cancel bookings",
+      });
+    }
+
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid booking ID",
+      });
+    }
+
+    const result = await bookingsCollection.updateOne(
+      {
+        _id: new ObjectId(id),
+        customerEmail: req.user.email.toLowerCase(),
+        status: "requested",
+      },
+      {
+        $set: {
+          status: "cancelled",
+          activeRequestKey: null,
+          updatedAt: new Date(),
+        },
+      },
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).send({
+        success: false,
+        message: "Booking not found or it can no longer be cancelled",
+      });
+    }
+
+    res.send({
+      success: true,
+      message: "Booking cancelled successfully",
+    });
+  } catch (error) {
+    console.error("Cancel booking:", error);
+
+    res.status(500).send({
+      success: false,
+      message: "Failed to cancel booking",
+    });
+  }
+});
 
 app.post("/services", async (req, res) => {
   try {
@@ -843,6 +1131,189 @@ app.post("/bookings", verfiyToken, async (req, res) => {
     return res.status(500).send({
       success: false,
       message: "Failed to submit repair request",
+    });
+  }
+});
+app.post("/payments/create-checkout-session", verfiyToken, async (req, res) => {
+  let checkoutSession;
+
+  try {
+    if (req.user.role !== "customer") {
+      return res.status(403).send({
+        success: false,
+        message: "Only customers can make payments",
+      });
+    }
+
+    const { bookingId } = req.body;
+
+    if (!bookingId || !ObjectId.isValid(bookingId)) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid booking ID",
+      });
+    }
+
+    if (!Number.isFinite(BDT_TO_USD_RATE) || BDT_TO_USD_RATE <= 0) {
+      return res.status(500).send({
+        success: false,
+        message: "Invalid BDT to USD exchange rate",
+      });
+    }
+
+    const customerEmail = req.user.email.toLowerCase();
+
+    // Find only the logged-in customer's booking
+    const booking = await bookingsCollection.findOne({
+      _id: new ObjectId(bookingId),
+      customerEmail,
+    });
+
+    if (!booking) {
+      return res.status(404).send({
+        success: false,
+        message: "Booking not found",
+      });
+    }
+
+    if (booking.status !== "completed") {
+      return res.status(400).send({
+        success: false,
+        message: "Only completed bookings can be paid",
+      });
+    }
+
+    if (booking.paymentStatus === "paid") {
+      return res.status(400).send({
+        success: false,
+        message: "This booking is already paid",
+      });
+    }
+
+    // Final amount is stored in BDT
+    const amountBDT = Number(booking.finalAmount ?? booking.basePrice);
+
+    if (!Number.isFinite(amountBDT) || amountBDT <= 0) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid booking amount",
+      });
+    }
+
+    // Convert BDT to USD
+    const amountUSD = amountBDT / BDT_TO_USD_RATE;
+
+    // Stripe requires USD cents
+    const stripeAmount = Math.round(amountUSD * 100);
+
+    if (stripeAmount < 50) {
+      return res.status(400).send({
+        success: false,
+        message: "Payment amount is below Stripe's minimum",
+      });
+    }
+
+    // Expire a previous unpaid Checkout Session if it is still open
+    if (booking.stripeSessionId) {
+      try {
+        const oldSession = await stripe.checkout.sessions.retrieve(
+          booking.stripeSessionId,
+        );
+
+        if (oldSession.status === "open") {
+          await stripe.checkout.sessions.expire(oldSession.id);
+        }
+      } catch (error) {
+        console.error(
+          "Could not expire previous checkout session:",
+          error.message,
+        );
+      }
+    }
+
+    // Create Checkout Session
+    checkoutSession = await stripe.checkout.sessions.create({
+      mode: "payment",
+
+      line_items: [
+        {
+          price_data: {
+            currency: "usd",
+
+            product_data: {
+              name: `FixMate - ${booking.serviceTitle}`,
+              description: `Original booking amount: BDT ${amountBDT}`,
+            },
+
+            unit_amount: stripeAmount,
+          },
+
+          quantity: 1,
+        },
+      ],
+
+      metadata: {
+        bookingId: booking._id.toString(),
+        customerEmail,
+        originalAmountBDT: String(amountBDT),
+        exchangeRate: String(BDT_TO_USD_RATE),
+      },
+
+      success_url: `${process.env.CLIENT_URL}/payments/success?session_id={CHECKOUT_SESSION_ID}`,
+
+      cancel_url: `${process.env.CLIENT_URL}/payments/cancel?bookingId=${booking._id}`,
+    });
+
+    // Save session ID only if booking is still unpaid and completed
+    const updateResult = await bookingsCollection.updateOne(
+      {
+        _id: booking._id,
+        customerEmail,
+        status: "completed",
+        paymentStatus: "unpaid",
+      },
+      {
+        $set: {
+          stripeSessionId: checkoutSession.id,
+          exchangeRate: BDT_TO_USD_RATE,
+          amountBDT,
+          amountUSD: stripeAmount / 100,
+          updatedAt: new Date(),
+        },
+      },
+    );
+
+    if (updateResult.matchedCount === 0) {
+      await stripe.checkout.sessions.expire(checkoutSession.id);
+
+      return res.status(409).send({
+        success: false,
+        message: "Booking status changed. Please try again.",
+      });
+    }
+
+    return res.send({
+      success: true,
+      url: checkoutSession.url,
+      amountBDT,
+      amountUSD: stripeAmount / 100,
+      exchangeRate: BDT_TO_USD_RATE,
+    });
+  } catch (error) {
+    console.error("Create checkout session error:", error);
+
+    // Expire an unlinked session if something failed after creation
+    if (checkoutSession?.id) {
+      try {
+        await stripe.checkout.sessions.expire(checkoutSession.id);
+      } catch (expireError) {
+        console.error("Session expiration error:", expireError.message);
+      }
+    }
+
+    return res.status(500).send({
+      success: false,
+      message: "Could not create checkout session",
     });
   }
 });
