@@ -188,8 +188,6 @@ app.post(
         },
       );
 
-      console.log("Payment successfully saved:", session.id);
-
       return res.send({
         received: true,
         message: "Payment processed successfully",
@@ -1365,3 +1363,5 @@ app.delete("/services/:id", verfiyToken, async (req, res) => {
 app.listen(port, () => {
   console.log(`server app listening on port ${port}`);
 });
+
+export default app;
