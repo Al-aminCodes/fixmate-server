@@ -429,10 +429,71 @@ app.get("/admin/payments", verfiyToken, verifyAdmin, async (req, res) => {
   }
 });
 
+app.get("/admin/overview", verfiyToken, verifyAdmin, async (req, res) => {
+  try {
+    // Only admins can access this dashboard.
+    if (req.user.role !== "admin") {
+      return res.status(403).send({
+        success: false,
+        message: "Admin access required.",
+      });
+    }
+
+    const [totalUsers, totalTechnicians, pendingServices] = await Promise.all([
+      usersCollection.countDocuments({}),
+
+      usersCollection.countDocuments({
+        role: "technician",
+      }),
+
+      servicesCollection.countDocuments({
+        approvalStatus: "pending",
+      }),
+    ]);
+
+    res.send({
+      success: true,
+      stats: {
+        totalUsers,
+        totalTechnicians,
+        pendingServices,
+      },
+    });
+  } catch (error) {
+    console.error("Admin overview error:", error);
+
+    res.status(500).send({
+      success: false,
+      message: "Failed to load admin dashboard.",
+    });
+  }
+});
+
 app.get("/user/:email", async (req, res) => {
-  const { email } = req.params;
-  const result = await users.findOne({ email: email });
-  res.send(result);
+  try {
+    const { email } = req.params;
+
+    const result = await users.findOne({ email });
+
+    if (!result) {
+      return res.status(404).send({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    res.status(200).send({
+      success: true,
+      user: result,
+    });
+  } catch (error) {
+    console.error("Get user error:", error);
+
+    res.status(500).send({
+      success: false,
+      message: "Failed to fetch user",
+    });
+  }
 });
 app.get("/customer/bookings", verfiyToken, async (req, res) => {
   try {
