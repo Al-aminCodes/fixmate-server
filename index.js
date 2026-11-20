@@ -196,6 +196,33 @@ app.get("/admin/services", async (req, res) => {
     });
   }
 });
+app.get("/technician/services", verfiyToken, async (req, res) => {
+  try {
+    if (req.user.role !== "technician") {
+      return res.status(403).send({
+        success: false,
+        message: "Access denied",
+      });
+    }
+
+    const services = await servicesCollection
+      .find({
+        technicianEmail: req.user.email.toLowerCase(),
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.send({
+      success: true,
+      services,
+    });
+  } catch (error) {
+    res.status(500).send({
+      success: false,
+      message: "Failed to fetch services",
+    });
+  }
+});
 
 app.get("/bookings", async (req, res) => {
   try {
@@ -297,6 +324,132 @@ app.patch("/bookings/:id/status", async (req, res) => {
   }
 });
 
+app.patch("/services/:id", verfiyToken, async (req, res) => {
+  try {
+    if (req.user.role !== "technician") {
+      return res.status(403).send({
+        success: false,
+        message: "Only technicians can update services.",
+      });
+    }
+
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid service ID.",
+      });
+    }
+
+    const {
+      title,
+      category,
+      description,
+      image,
+      basePrice,
+      estimatedDuration,
+      serviceMode,
+      serviceArea,
+    } = req.body;
+
+    const validCategories = [
+      "Smartphone",
+      "Laptop & PC",
+      "AC",
+      "Refrigerator",
+      "TV",
+      "Washing Machine",
+      "Electrical",
+    ];
+
+    const validModes = ["Home Visit", "Shop Drop-off"];
+
+    if (
+      !title?.trim() ||
+      !category ||
+      !description?.trim() ||
+      !image ||
+      !estimatedDuration?.trim() ||
+      !serviceMode ||
+      !serviceArea?.trim()
+    ) {
+      return res.status(400).send({
+        success: false,
+        message: "Please provide all required service fields.",
+      });
+    }
+
+    if (!validCategories.includes(category)) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid service category.",
+      });
+    }
+
+    if (!validModes.includes(serviceMode)) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid service mode.",
+      });
+    }
+
+    const price = Number(basePrice);
+
+    if (!Number.isFinite(price) || price <= 0) {
+      return res.status(400).send({
+        success: false,
+        message: "Base price must be greater than zero.",
+      });
+    }
+
+    const updateData = {
+      title: title.trim(),
+      category,
+      description: description.trim(),
+      image,
+      basePrice: price,
+      estimatedDuration: estimatedDuration.trim(),
+      serviceMode,
+      serviceArea: serviceArea.trim(),
+
+      // Edited services require admin approval again.
+      approvalStatus: "pending",
+
+      updatedAt: new Date(),
+    };
+
+    const result = await servicesCollection.updateOne(
+      {
+        _id: new ObjectId(id),
+        technicianEmail: req.user.email.toLowerCase(),
+      },
+      {
+        $set: updateData,
+      },
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).send({
+        success: false,
+        message: "Service not found or you do not own this service.",
+      });
+    }
+
+    res.status(200).send({
+      success: true,
+      message: "Service updated. Waiting for admin approval.",
+    });
+  } catch (error) {
+    console.error("Update service error:", error);
+
+    res.status(500).send({
+      success: false,
+      message: "Failed to update service.",
+    });
+  }
+});
+
 // Approve or reject a service
 app.patch("/admin/services/:id/approval", async (req, res) => {
   try {
@@ -344,6 +497,66 @@ app.patch("/admin/services/:id/approval", async (req, res) => {
     res.status(500).send({
       success: false,
       message: "Failed to update service approval.",
+    });
+  }
+});
+app.patch("/services/:id/availability", verfiyToken, async (req, res) => {
+  try {
+    if (req.user.role !== "technician") {
+      return res.status(403).send({
+        success: false,
+        message: "Only technicians can change availability.",
+      });
+    }
+
+    const { id } = req.params;
+    const { isAvailable } = req.body;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid service ID.",
+      });
+    }
+
+    if (typeof isAvailable !== "boolean") {
+      return res.status(400).send({
+        success: false,
+        message: "isAvailable must be a boolean.",
+      });
+    }
+
+    const result = await servicesCollection.updateOne(
+      {
+        _id: new ObjectId(id),
+        technicianEmail: req.user.email.toLowerCase(),
+      },
+      {
+        $set: {
+          isAvailable,
+          updatedAt: new Date(),
+        },
+      },
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).send({
+        success: false,
+        message: "Service not found or you do not own this service.",
+      });
+    }
+
+    res.status(200).send({
+      success: true,
+      message: `Service ${isAvailable ? "enabled" : "disabled"} successfully.`,
+      isAvailable,
+    });
+  } catch (error) {
+    console.error("Toggle availability error:", error);
+
+    res.status(500).send({
+      success: false,
+      message: "Failed to update availability.",
     });
   }
 });
@@ -630,6 +843,50 @@ app.post("/bookings", verfiyToken, async (req, res) => {
     return res.status(500).send({
       success: false,
       message: "Failed to submit repair request",
+    });
+  }
+});
+
+app.delete("/services/:id", verfiyToken, async (req, res) => {
+  try {
+    if (req.user.role !== "technician") {
+      return res.status(403).send({
+        success: false,
+        message: "Only technicians can delete services.",
+      });
+    }
+
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid service ID.",
+      });
+    }
+
+    const result = await servicesCollection.deleteOne({
+      _id: new ObjectId(id),
+      technicianEmail: req.user.email.toLowerCase(),
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).send({
+        success: false,
+        message: "Service not found or you do not own this service.",
+      });
+    }
+
+    res.status(200).send({
+      success: true,
+      message: "Service deleted successfully.",
+    });
+  } catch (error) {
+    console.error("Delete service error:", error);
+
+    res.status(500).send({
+      success: false,
+      message: "Failed to delete service.",
     });
   }
 });
