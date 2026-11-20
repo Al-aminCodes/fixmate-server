@@ -397,6 +397,38 @@ app.get("/admin/users", verfiyToken, verifyAdmin, async (req, res) => {
   }
 });
 
+app.get("/admin/payments", verfiyToken, verifyAdmin, async (req, res) => {
+  try {
+    // Only admins can view platform transactions.
+    if (req.user.role !== "admin") {
+      return res.status(403).send({
+        success: false,
+        message: "Admin access required.",
+      });
+    }
+
+    const payments = await paymentsCollection
+      .find({})
+      .sort({ paidAt: -1 })
+      .toArray();
+
+    res.send({
+      success: true,
+      payments: payments.map((payment) => ({
+        ...payment,
+        _id: payment._id.toString(),
+      })),
+    });
+  } catch (error) {
+    console.error("Admin payments error:", error);
+
+    res.status(500).send({
+      success: false,
+      message: "Failed to fetch payment transactions.",
+    });
+  }
+});
+
 app.get("/user/:email", async (req, res) => {
   const { email } = req.params;
   const result = await users.findOne({ email: email });
